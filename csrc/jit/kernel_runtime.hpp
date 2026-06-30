@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <c10/cuda/CUDAStream.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/format.hpp"
@@ -54,16 +55,26 @@ public:
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        const auto using_objdump = exit_code != 0;
+        if (using_objdump) {
+            const auto objdump_result = call_external_command(fmt::format("objdump -t {}", cubin_path.c_str()));
+            exit_code = std::get<0>(objdump_result);
+            symbols = std::get<1>(objdump_result);
+        }
         DG_HOST_ASSERT(exit_code == 0);
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line); ) {
-            if (line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos and
+            const auto is_cuobjdump_entry = line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos;
+            const auto is_objdump_entry = using_objdump and line.find(" F ") != std::string::npos and
+                                          line.find(".text.") != std::string::npos;
+            if ((is_cuobjdump_entry or is_objdump_entry) and
                 std::none_of(illegal_names.begin(), illegal_names.end(),
                 [&](const auto name) { return line.find(name) != std::string::npos; })) {
-                const auto last_space = line.rfind(' ');
-                symbol_names.push_back(line.substr(last_space + 1));
+                const auto last_space = line.find_last_not_of(" 	") == std::string::npos ? std::string::npos : line.find_last_of(" 	", line.find_last_not_of(" 	"));
+                DG_HOST_ASSERT(last_space != std::string::npos);
+                symbol_names.push_back(line.substr(line.find_first_not_of(" 	", last_space)));
             }
         }
 
@@ -138,7 +149,7 @@ public:
     template <typename Args>
     static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
         const auto kernel = kernel_runtime->kernel;
-        const auto stream = at::cuda::getCurrentCUDAStream();
+        const auto stream = c10::cuda::getCurrentCUDAStream();
         LaunchArgs launch_args = args.launch_args;
 
         // Allow runtime override from Python.

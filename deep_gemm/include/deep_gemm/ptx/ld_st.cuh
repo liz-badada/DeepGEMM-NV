@@ -145,6 +145,18 @@ CUTLASS_DEVICE void st_shared_bulk(void* smem_ptr, const uint32_t& num_bytes) {
 }
 
 /// Global memory
+CUTLASS_DEVICE float ldu_global(const float* ptr) {
+    float ret;
+    asm volatile("ldu.global.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
+    return ret;
+}
+
+CUTLASS_DEVICE float ld_global_nc_f32(const float* ptr) {
+    float ret;
+    asm volatile("ld.global.nc.L2::64B.f32 %0, [%1];" : "=f"(ret) : "l"(ptr));
+    return ret;
+}
+
 CUTLASS_DEVICE uint64_t ld_volatile(const uint64_t* ptr) {
     uint64_t ret;
     asm volatile("ld.volatile.global.b64 %0, [%1];" : "=l"(ret) : "l"(ptr));
@@ -165,6 +177,11 @@ CUTLASS_DEVICE uint64_t ld_acq_sys(const uint64_t* ptr) {
 
 CUTLASS_DEVICE void st_relaxed_sys(const uint64_t* ptr, const uint64_t& value) {
     asm volatile("st.L1::no_allocate.relaxed.sys.global.u64 [%0], %1;" :: "l"(ptr), "l"(value));
+}
+
+CUTLASS_DEVICE void st_global_v4_u32(uint4* ptr, const uint4& value) {
+    asm volatile("st.global.v4.u32 [%0], {%1, %2, %3, %4};" ::
+                 "l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w) : "memory");
 }
 
 /// Atomics
@@ -239,6 +256,30 @@ CUTLASS_DEVICE longlong4_t ld_gez_pred(const longlong4_t* ptr, const int& pred) 
         "}"
         : "+l"(ret.x), "+l"(ret.y), "+l"(ret.z), "+l"(ret.w)
         : "l"(ptr), "r"(pred)
+        : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE uint4 ld_gez_pred(const uint4* ptr, const int& pred) {
+    uint4 ret = make_uint4(0, 0, 0, 0);
+    asm volatile(
+        "{\n\t"
+        "  .reg .pred p;\n\t"
+        "  setp.ge.s32 p, %5, 0;\n\t"
+        "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n\t"
+        "}"
+        : "+r"(ret.x), "+r"(ret.y), "+r"(ret.z), "+r"(ret.w)
+        : "l"(ptr), "r"(pred)
+        : "memory");
+    return ret;
+}
+
+CUTLASS_DEVICE uint4 ld_global_l2_256b(const uint4* ptr) {
+    uint4 ret;
+    asm volatile(
+        "ld.global.L2::256B.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
+        : "l"(ptr)
         : "memory");
     return ret;
 }

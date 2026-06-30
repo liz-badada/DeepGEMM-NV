@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <filesystem>
@@ -33,6 +32,27 @@ public:
         Compiler::library_include_path = Compiler::library_root_path / "include";
         Compiler::cuda_home = cuda_home_path_by_python;
         Compiler::cuobjdump_path = Compiler::cuda_home / "bin" / "cuobjdump";
+    }
+
+    static std::string make_jit_include_flags() {
+        std::string include_flags;
+        auto add_if_exists = [&](const std::filesystem::path& path) {
+            if (std::filesystem::exists(path))
+                include_flags += fmt::format("-I{} ", path.string());
+        };
+
+        add_if_exists(library_include_path);
+        add_if_exists(cuda_home / "include");
+        add_if_exists(cuda_home / "include" / "cccl");
+        const auto cuda_package_root = cuda_home.parent_path().parent_path().parent_path();
+        const auto cuda_version_dir = cuda_home.filename();
+        if (not cuda_package_root.empty() and not cuda_version_dir.empty()) {
+            const auto cccl_home = cuda_package_root / "pydeps_cccl" / "nvidia" / cuda_version_dir;
+            add_if_exists(cccl_home / "include");
+            add_if_exists(cccl_home / "include" / "cccl");
+        }
+        add_if_exists(library_root_path.parent_path() / "third-party" / "cutlass" / "include");
+        return include_flags;
     }
 
     std::string signature, flags;
@@ -208,10 +228,11 @@ public:
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
         const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
-        flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
+        const auto include_dirs = make_jit_include_flags();
+        flags = fmt::format("{} {}--gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",
-                            flags, library_include_path.c_str(), arch);
+                            flags, include_dirs, arch);
     }
 
     void compile(const std::string &code, const std::filesystem::path& dir_path,
@@ -267,9 +288,7 @@ public:
         DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");
 
         // Build include directories list
-        std::string include_dirs;
-        include_dirs += fmt::format("-I{} ", library_include_path.string());
-        include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());
+        const auto include_dirs = make_jit_include_flags();
 
         // Add PCH support for version 12.8 and above
         // NOTES: PCH is vital for compilation speed

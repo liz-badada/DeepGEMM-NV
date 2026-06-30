@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Tuple, Optional
 from ..utils.math import align
@@ -11,6 +12,68 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+
+_symm_mem_backend: Optional[str] = None
+
+
+def _maybe_set_symm_mem_backend() -> None:
+    """Set the symmetric-memory backend from ``DG_SYMM_MEM_BACKEND``.
+
+    :raises RuntimeError: If the requested backend changes after it was set.
+    """
+    backend = os.environ.get("DG_SYMM_MEM_BACKEND")
+    if not backend:
+        return
+    global _symm_mem_backend
+    if _symm_mem_backend is None:
+        symm_mem.set_backend(backend)
+        _symm_mem_backend = backend
+    elif _symm_mem_backend != backend:
+        raise RuntimeError(
+            f"DG_SYMM_MEM_BACKEND changed from {_symm_mem_backend} to {backend}")
+
+
+def _empty_symm_mem_for_group(num_bytes: int, group: dist.ProcessGroup) -> torch.Tensor:
+    """Allocate symmetric memory for a process group.
+
+    :param num_bytes: Number of bytes to allocate.
+    :type num_bytes: int
+    :param group: Process group that will rendezvous the allocation.
+    :type group: dist.ProcessGroup
+    :return: One-dimensional int8 symmetric-memory tensor.
+    :rtype: torch.Tensor
+    """
+    group_name = group.group_name
+    enable_fn = getattr(symm_mem, "enable_symm_mem_for_group", None)
+    if enable_fn is not None:
+        enable_fn(group_name)
+
+    get_backend = getattr(symm_mem, "get_backend", None)
+    backend = get_backend(torch.device("cuda")) if get_backend is not None else None
+    try:
+        return symm_mem.empty(num_bytes, dtype=torch.int8, device="cuda")
+    except RuntimeError as exc:
+        if "no group info associated" not in str(exc) or backend == "NCCL":
+            raise
+
+    allocator_owner = getattr(symm_mem, "_SymmetricMemory", None)
+    allocator = getattr(allocator_owner, "empty_strided_p2p", None)
+    if allocator is None:
+        return symm_mem.empty(num_bytes, dtype=torch.int8, device="cuda")
+
+    allocator_args = (
+        (num_bytes,),
+        (1,),
+        torch.int8,
+        torch.device(f"cuda:{torch.cuda.current_device()}"),
+    )
+    if backend == "NVSHMEM":
+        return allocator(*allocator_args, None)
+
+    return allocator(
+        *allocator_args,
+        group_name,
+    )
 
 
 class SymmBuffer:
@@ -35,7 +98,8 @@ class SymmBuffer:
             hidden, intermediate_hidden,
             use_fp8_dispatch, activation
         )
-        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device='cuda')
+        _maybe_set_symm_mem_backend()
+        self.buffer = _empty_symm_mem_for_group(num_bytes, group)
         self.handle = symm_mem.rendezvous(self.buffer, group=group)
         self.buffer.zero_()
         self.group.barrier()
@@ -181,3 +245,201 @@ def fp8_mega_moe(y: torch.Tensor,
         activation, activation_clamp,
         fast_math
     )
+
+
+def get_build_cudart_version_for_mega_moe() -> int:
+    """Return the CUDA Runtime version used to build MegaMoE APIs.
+
+    .. code-block:: python
+
+       build_version = deep_gemm.get_build_cudart_version_for_mega_moe()
+
+    :return: Integer ``CUDART_VERSION`` captured at extension build time.
+    :rtype: int
+    """
+    return int(_C.get_build_cudart_version_for_mega_moe())
+
+
+def _default_sm90_green_sms_split(
+    device_sms: int,
+    num_max_tokens_per_rank: Optional[int] = None,
+    num_tokens: Optional[int] = None,
+) -> Tuple[int, int, int]:
+    """Return a legal default SM split for the SM90 Green Context graph.
+
+    K1 and K2 run on Green Context SM partitions whose coscheduled group size
+    is at least two SMs, so both partitions must be even. Odd-SM devices leave
+    one SM outside the K1/K2 split while K3 still uses the full device.
+
+    :param device_sms: Number of SMs reported by the current CUDA device.
+    :type device_sms: int
+    :param num_max_tokens_per_rank: Optional symmetric-buffer token capacity,
+        used as a fallback when num_tokens is not available.
+    :type num_max_tokens_per_rank: int, optional
+    :param num_tokens: Optional active token count for the current graph. H200
+        large-token profiles prefer a larger K2 partition.
+    :type num_tokens: int, optional
+    :raises ValueError: If fewer than four SMs are available.
+    :return: K1, K2, and K3 SM counts.
+    :rtype: Tuple[int, int, int]
+    """
+    if device_sms < 4:
+        raise ValueError(f'SM90 MegaMoE Green Context requires at least 4 SMs, got {device_sms}')
+
+    split_sms = device_sms - (device_sms % 2)
+    if split_sms >= 80:
+        active_tokens = num_tokens if num_tokens is not None else (num_max_tokens_per_rank or 0)
+        if split_sms == 132 and active_tokens >= 8192:
+            kernel2_sms = 60
+        elif split_sms == 132 and active_tokens >= 4096:
+            kernel2_sms = 54
+        elif split_sms == 132 and active_tokens >= 2048:
+            kernel2_sms = 56
+        elif split_sms == 132 and active_tokens >= 512:
+            kernel2_sms = 56
+        else:
+            kernel2_sms = 52
+    else:
+        kernel2_sms = max(2, (split_sms // 3) & ~1)
+    kernel2_sms = min(kernel2_sms, split_sms - 2)
+    if kernel2_sms % 2 != 0:
+        kernel2_sms -= 1
+    kernel2_sms = max(2, kernel2_sms)
+    kernel1_sms = split_sms - kernel2_sms
+    if kernel1_sms <= 1 or kernel2_sms <= 1:
+        raise ValueError(
+            f'Green Context partitions require at least 2 SMs, got {kernel1_sms}/{kernel2_sms}')
+    if kernel1_sms % 2 != 0 or kernel2_sms % 2 != 0:
+        raise ValueError(
+            f'Green Context partitions must be even, got {kernel1_sms}/{kernel2_sms}')
+    if kernel1_sms + kernel2_sms > device_sms:
+        raise ValueError(
+            f'Green Context split {kernel1_sms}+{kernel2_sms} exceeds {device_sms} device SMs')
+    return kernel1_sms, kernel2_sms, device_sms
+
+
+class SM90FP8MegaMoEGreenCtxGraph:
+    """SM90 MegaMoE graph using Green Context split SM partitions.
+
+    K1 runs dispatch + L1 + SwiGLU, K2 runs L2 + combine scatter concurrently
+    on a disjoint SM partition, and K3 runs the final top-k combine reduce.
+    The fused/two-kernel ``fp8_mega_moe`` API is unchanged; this graph is an
+    explicit opt-in path for H200/Hopper tuning.
+    """
+    def __init__(self,
+                 y: torch.Tensor,
+                 l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                 l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                 sym_buffer: SymmBuffer,
+                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                 recipe: Tuple[int, int, int] = (128, 128, 128),
+                 activation: str = 'swiglu',
+                 activation_clamp: Optional[float] = None,
+                 fast_math: bool = True,
+                 kernel1_sms: Optional[int] = None,
+                 kernel2_sms: Optional[int] = None,
+                 reduce_sms: Optional[int] = None):
+        """Create an SM90 MegaMoE Green Context graph.
+
+        .. code-block:: python
+
+           graph = deep_gemm.SM90FP8MegaMoEGreenCtxGraph(
+               y, l1_weights, l2_weights, sym_buffer,
+               cumulative_local_expert_recv_stats=stats,
+           )
+           graph.replay()
+
+        :param y: Output tensor with shape ``(num_tokens, hidden)``.
+        :type y: torch.Tensor
+        :param l1_weights: Linear1 FP8 weights and scale factors.
+        :type l1_weights: Tuple[torch.Tensor, torch.Tensor]
+        :param l2_weights: Linear2 FP8 weights and scale factors.
+        :type l2_weights: Tuple[torch.Tensor, torch.Tensor]
+        :param sym_buffer: Symmetric MegaMoE communication workspace.
+        :type sym_buffer: SymmBuffer
+        :param cumulative_local_expert_recv_stats: Optional stats buffer,
+            defaults to None.
+        :type cumulative_local_expert_recv_stats: torch.Tensor, optional
+        :param recipe: MegaMoE tile recipe, defaults to ``(128, 128, 128)``.
+        :type recipe: Tuple[int, int, int], optional
+        :param activation: Activation name, defaults to ``'swiglu'``.
+        :type activation: str, optional
+        :param activation_clamp: Activation clamp value, defaults to None.
+        :type activation_clamp: float, optional
+        :param fast_math: Whether to use fast math, defaults to True.
+        :type fast_math: bool, optional
+        :param kernel1_sms: SMs assigned to dispatch + L1, defaults to None.
+        :type kernel1_sms: int, optional
+        :param kernel2_sms: SMs assigned to L2 + combine scatter, defaults to
+            None.
+        :type kernel2_sms: int, optional
+        :param reduce_sms: SMs assigned to final combine reduce, defaults to
+            None.
+        :type reduce_sms: int, optional
+        """
+        build_cudart_version = get_build_cudart_version_for_mega_moe()
+        if build_cudart_version < 13020:
+            raise RuntimeError(
+                f'SM90 MegaMoE Green Context requires CUDA Runtime 13.2+, '
+                f'but DeepGEMM was built with CUDART_VERSION={build_cudart_version}')
+        device_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        num_tokens = int(y.size(0))
+        default_kernel1_sms, default_kernel2_sms, default_reduce_sms = _default_sm90_green_sms_split(
+            device_sms, sym_buffer.num_max_tokens_per_rank, num_tokens)
+        default_split_sms = default_kernel1_sms + default_kernel2_sms
+        if kernel2_sms is None:
+            kernel2_sms = default_kernel2_sms
+        if kernel1_sms is None:
+            kernel1_sms = default_split_sms - kernel2_sms
+        if reduce_sms is None:
+            reduce_sms = default_reduce_sms
+        if kernel1_sms <= 1 or kernel2_sms <= 1 or reduce_sms <= 0:
+            raise ValueError(
+                f'Invalid Green Context SM counts: K1={kernel1_sms}, '
+                f'K2={kernel2_sms}, K3={reduce_sms}')
+        if kernel1_sms + kernel2_sms > device_sms:
+            raise ValueError(
+                f'Green Context split {kernel1_sms}+{kernel2_sms} exceeds {device_sms} device SMs')
+        if reduce_sms > device_sms:
+            raise ValueError(f'K3 SM count {reduce_sms} exceeds {device_sms} device SMs')
+        if kernel1_sms % 2 != 0 or kernel2_sms % 2 != 0:
+            raise ValueError(
+                f'Green Context partitions must be even, got {kernel1_sms}/{kernel2_sms}')
+
+        if cumulative_local_expert_recv_stats is None:
+            num_experts_per_rank = l1_weights[0].shape[0]
+            phase_profile_enabled = os.environ.get('DG_SM90_MOE_PHASE_PROFILE', '0') != '0'
+            phase_profile_int_offset = num_experts_per_rank + (num_experts_per_rank % 2)
+            stats_numel = phase_profile_int_offset + 256 if phase_profile_enabled else num_experts_per_rank
+            cumulative_local_expert_recv_stats = torch.zeros(stats_numel, dtype=torch.int, device=y.device)
+        self.stats = cumulative_local_expert_recv_stats
+        self.y = y
+        self.sym_buffer = sym_buffer
+        self.kernel1_sms = kernel1_sms
+        self.kernel2_sms = kernel2_sms
+        self.reduce_sms = reduce_sms
+        self._impl = _C.SM90FP8MegaMoEGreenCtxGraph(
+            y,
+            l1_weights, l2_weights,
+            cumulative_local_expert_recv_stats,
+            sym_buffer.buffer,
+            sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+            sym_buffer.num_max_tokens_per_rank,
+            sym_buffer.num_experts, sym_buffer.num_topk,
+            recipe,
+            activation, activation_clamp,
+            fast_math,
+            kernel1_sms, kernel2_sms, reduce_sms,
+        )
+
+    def replay(self):
+        """Replay the captured Green Context graph on the current CUDA stream."""
+        self._impl.replay()
+
+    def get_green_context_ids(self):
+        """Return the two Green Context execution context IDs.
+
+        :return: K1 and K2 execution context IDs.
+        :rtype: tuple[int, int]
+        """
+        return self._impl.get_green_context_ids()

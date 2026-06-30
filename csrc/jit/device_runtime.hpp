@@ -1,13 +1,14 @@
 #pragma once
 
 #include <cublasLt.h>
+#include <cuda_runtime.h>
+#include <torch/extension.h>
 #include <torch/version.h>
-#include <ATen/cuda/CUDAContext.h>
 
 #include "../utils/exception.hpp"
 #include "../utils/lazy_init.hpp"
 
-#define PYTORCH_SUPPORTS_GET_CUBLASLT_HANDLE (TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3))
+#define PYTORCH_SUPPORTS_GET_CUBLASLT_HANDLE 0
 
 namespace deep_gemm {
 

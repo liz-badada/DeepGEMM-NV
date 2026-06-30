@@ -1,8 +1,8 @@
 #pragma once
 
 #include <cublasLt.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cute/arch/mma_sm100_umma.hpp>
 
 #include "../../jit/device_runtime.hpp"
@@ -60,7 +60,7 @@ static void call_cublaslt_api(const cublasOperation_t& trans_a,
     const auto handle = device_runtime->get_cublaslt_handle();
     const auto workspace = device_runtime->get_cublaslt_workspace();
     const auto workspace_bytes = workspace.nbytes();
-    const auto stream = at::cuda::getCurrentCUDAStream();
+    const auto stream = c10::cuda::getCurrentCUDAStream();
 
     // Algorithm selection
     cublasLtMatmulPreference_t pref;

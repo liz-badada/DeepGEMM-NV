@@ -282,6 +282,11 @@ struct MegaMoESM90Config {
     // SM90 path follow the same single-source-of-truth style as regular GEMM
     // configs: the selector chooses a complete candidate, then launch consumes it.
     bool direct_l2_scatter, l2_nmajor_schedule, one_warp_cleanup;
+    bool split_sfa_tma, l2_dual_accum, l1_dual_k_accum, l2_sfa_2row_tma;
+    bool l2_precompute_scale, l2_ratio_accum, l2_weight_sf_ldu;
+    bool l2_prefetch_weight_sf, l2_fast_weight_sf_n, l2_hoist_weight_sf_base;
+    bool l2_delay_sfa_load, l2_split_sfa_load, l2_skip_post_wgmma_fence;
+    bool l2_first_accum_assign, l2_n64_interleave, l2_half_k_pipeline, async_l1_tma_store;
 
     friend std::ostream& operator << (std::ostream& os, const MegaMoESM90Config& config) {
         os << "MegaMoESM90Config("
@@ -297,7 +302,24 @@ struct MegaMoESM90Config {
            << ", num_epilogue_threads=" << config.num_epilogue_threads
            << ", direct_l2_scatter=" << config.direct_l2_scatter
            << ", l2_nmajor_schedule=" << config.l2_nmajor_schedule
-           << ", one_warp_cleanup=" << config.one_warp_cleanup << ")";
+           << ", one_warp_cleanup=" << config.one_warp_cleanup
+           << ", split_sfa_tma=" << config.split_sfa_tma
+           << ", l2_dual_accum=" << config.l2_dual_accum
+           << ", l1_dual_k_accum=" << config.l1_dual_k_accum
+           << ", l2_sfa_2row_tma=" << config.l2_sfa_2row_tma
+           << ", l2_precompute_scale=" << config.l2_precompute_scale
+           << ", l2_ratio_accum=" << config.l2_ratio_accum
+           << ", l2_weight_sf_ldu=" << config.l2_weight_sf_ldu
+           << ", l2_prefetch_weight_sf=" << config.l2_prefetch_weight_sf
+           << ", l2_fast_weight_sf_n=" << config.l2_fast_weight_sf_n
+           << ", l2_hoist_weight_sf_base=" << config.l2_hoist_weight_sf_base
+           << ", l2_delay_sfa_load=" << config.l2_delay_sfa_load
+           << ", l2_split_sfa_load=" << config.l2_split_sfa_load
+           << ", l2_skip_post_wgmma_fence=" << config.l2_skip_post_wgmma_fence
+           << ", l2_first_accum_assign=" << config.l2_first_accum_assign
+           << ", l2_n64_interleave=" << config.l2_n64_interleave
+           << ", l2_half_k_pipeline=" << config.l2_half_k_pipeline
+           << ", async_l1_tma_store=" << config.async_l1_tma_store << ")";
         return os;
     }
 };
@@ -359,11 +381,9 @@ struct Sm90MoeHeuristicPolicy {
     bool uses_bn256_main_tile() const {
         return block_m == 64 and block_n == 256;
     }
-
     bool is_main_topk8() const {
         return num_experts_per_rank == 32 and num_topk == 8 and intermediate_hidden == 2048;
     }
-
     bool is_hopper_topk6() const {
         return num_experts_per_rank == 48 and num_topk == 6 and intermediate_hidden == 3072;
     }
@@ -591,28 +611,33 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& block_m, const int& block_n, const int& block_k,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
     const bool& direct_l2_scatter_enabled = false,
+    const bool& async_l1_tma_store_enabled = false,
     const int& default_num_stages = 0) {
     constexpr int kSmemAlignment = 1024;
 
-    // Dispatch region (same as SM100)
-    const int smem_expert_count_size = align(
-        num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment);
-    const int smem_send_buffers_size = align(
+    // Dispatch region (same as SM100). Dedicated split K2 variants have no
+    // dispatch warps, matching PR357's l2_combine structure.
+    const bool has_dispatch = num_dispatch_warps > 0;
+    const int smem_expert_count_size = has_dispatch ? align(
+        num_experts * static_cast<int>(sizeof(uint32_t)), kSmemAlignment) : 0;
+    const int smem_send_buffers_size = has_dispatch ? align(
         static_cast<int>(layout::Buffer(layout::Data(hidden), num_dispatch_warps, 1).get_num_bytes()),
-        kSmemAlignment);
+        kSmemAlignment) : 0;
     const int smem_dispatch_size = smem_expert_count_size + smem_send_buffers_size;
 
     // C/D output region: max of L1 FP8 (single-buffered, BLOCK_N/2 post-SwiGLU)
     // and L2 BF16, then 1024-byte aligned (matches kernel's SMEM_CD_SIZE).
     const auto num_epilogue_warpgroups = num_epilogue_warps / 4;
-    const bool split_n_warpgroups = block_m == 64 and block_n == 256 and num_epilogue_warpgroups == 2;
+    const bool split_n_warpgroups = block_m == 64 and block_n == 256 and
+        (num_epilogue_warpgroups == 2 or num_epilogue_warpgroups == 4);
     const bool serial_n_warpgroups = false;
     const int wg_block_m = split_n_warpgroups ? block_m : block_m / num_epilogue_warpgroups;
-    const int wg_block_n = (split_n_warpgroups or serial_n_warpgroups) ? block_n / 2 : block_n;
+    const int wg_block_n = split_n_warpgroups ? block_n / num_epilogue_warpgroups :
+                           (serial_n_warpgroups ? block_n / 2 : block_n);
     const int smem_cd_l1 = num_epilogue_warpgroups * wg_block_m * (wg_block_n / 2);  // 1 byte/elem (FP8)
     const bool direct_l2_scatter = direct_l2_scatter_enabled and
                                    not serial_n_warpgroups and wg_block_n == 128;
-    const bool async_l1_tma_store = false;
+    const bool async_l1_tma_store = async_l1_tma_store_enabled and split_n_warpgroups;
     const int smem_cd_l2 = direct_l2_scatter ? 0 :
         num_epilogue_warpgroups * wg_block_m * wg_block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd_l1_async = async_l1_tma_store ?
@@ -844,7 +869,6 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                     auto cleanup_candidates = get_sm90_moe_bool_candidates(
                         "DG_SM90_MOE_ONE_WARP_CLEANUP",
                         one_warp_cleanup_default);
-
                     const int default_epw = get_num_experts_per_wave_for_mega_moe_sm90(
                         num_experts_per_rank, num_tokens, num_topk,
                         intermediate_hidden, block_m, block_n, num_sms);
@@ -875,6 +899,7 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                                 block_m, block_n, block_k,
                                 num_dispatch_threads / 32, num_epilogue_threads / 32,
                                 direct_l2_scatter,
+                                false,
                                 requested_num_stages);
                             for (const int& l2_nmajor_value: l2_nmajor_candidates) {
                                 for (const int& cleanup_value: cleanup_candidates) {
@@ -891,7 +916,9 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                                             num_experts_per_wave,
                                             num_stages, smem_size,
                                             num_dispatch_threads, num_non_epilogue_threads, num_epilogue_threads,
-                                            direct_l2_scatter, l2_nmajor_value != 0, cleanup_value != 0
+                                            direct_l2_scatter, l2_nmajor_value != 0, cleanup_value != 0,
+                                            false, false, false, false, false, false, false, false,
+                                            false, false, false, false, false, false, false, false, false
                                         });
                                     }
                                 }

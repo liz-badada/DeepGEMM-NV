@@ -1,7 +1,9 @@
 #pragma once
 
 #include <functional>
+#include <cuda_runtime_api.h>
 #include <pybind11/functional.h>
+#include <pybind11/stl.h>
 
 #if DG_TENSORMAP_COMPATIBLE
 #include "../jit/compiler.hpp"
@@ -14,6 +16,10 @@ namespace deep_gemm::mega {
 
 static int get_token_alignment_for_mega_moe() {
     return layout::kLCMCandidateBlockM;
+}
+
+static int get_build_cudart_version_for_mega_moe() {
+    return CUDART_VERSION;
 }
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
@@ -207,8 +213,10 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         const auto stats_numel = cumulative_local_expert_recv_stats->numel();
         const bool phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0;
-        DG_HOST_ASSERT(stats_numel == num_experts_per_rank or
-                       (phase_profile and stats_numel >= num_experts_per_rank + 64));
+        const auto phase_profile_int_offset = math::align<int64_t>(num_experts_per_rank, 2);
+        DG_HOST_ASSERT(phase_profile ?
+                       stats_numel >= phase_profile_int_offset + 144 :
+                       stats_numel >= num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
@@ -322,8 +330,10 @@ static void fp8_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         const auto stats_numel = cumulative_local_expert_recv_stats->numel();
         const bool phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0;
-        DG_HOST_ASSERT(stats_numel == num_experts_per_rank or
-                       (phase_profile and stats_numel >= num_experts_per_rank + 64));
+        const auto phase_profile_int_offset = math::align<int64_t>(num_experts_per_rank, 2);
+        DG_HOST_ASSERT(phase_profile ?
+                       stats_numel >= phase_profile_int_offset + 256 :
+                       stats_numel >= num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
 
@@ -361,9 +371,32 @@ static void fp8_mega_moe(
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
+    m.def("get_build_cudart_version_for_mega_moe", &get_build_cudart_version_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("fp8_mega_moe", &fp8_mega_moe);
+    pybind11::class_<SM90FP8MegaMoEGreenCtxGraph>(m, "SM90FP8MegaMoEGreenCtxGraph")
+        .def(pybind11::init<
+             const torch::Tensor&,
+             const std::tuple<torch::Tensor, torch::Tensor>&,
+             const std::tuple<torch::Tensor, torch::Tensor>&,
+             const torch::Tensor&,
+             const torch::Tensor&,
+             const std::vector<int64_t>&,
+             const int&,
+             const int&,
+             const int&,
+             const int&,
+             const std::tuple<int, int, int>&,
+             const std::string&,
+             const std::optional<float>&,
+             const bool&,
+             const int&,
+             const int&,
+             const int&>())
+        .def("replay", &SM90FP8MegaMoEGreenCtxGraph::replay,
+             pybind11::call_guard<pybind11::gil_scoped_release>())
+        .def("get_green_context_ids", &SM90FP8MegaMoEGreenCtxGraph::get_green_context_ids);
 #endif
 }
 

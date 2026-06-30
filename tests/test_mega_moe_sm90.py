@@ -28,13 +28,14 @@ Notes
 """
 
 import argparse
+from contextlib import contextmanager
 import math
 import os
 import random
 import sys
 import torch
 import torch.distributed as dist
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Iterator
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -44,6 +45,28 @@ import deep_gemm
 from deep_gemm.utils import per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import calc_diff, get_arch_major
+
+
+@contextmanager
+def _masked_hint_scope(enabled: bool) -> Iterator[None]:
+    """Set the SM90 MegaMoE masked-routing hint for one operation.
+
+    :param enabled: Whether to set ``DG_SM90_MOE_MASKED_HINT=1``.
+    :type enabled: bool
+    :return: Context manager that restores the previous environment value.
+    :rtype: Iterator[None]
+    """
+    old_masked_hint = os.environ.get('DG_SM90_MOE_MASKED_HINT')
+    if enabled:
+        os.environ['DG_SM90_MOE_MASKED_HINT'] = '1'
+    try:
+        yield
+    finally:
+        if enabled:
+            if old_masked_hint is None:
+                os.environ.pop('DG_SM90_MOE_MASKED_HINT', None)
+            else:
+                os.environ['DG_SM90_MOE_MASKED_HINT'] = old_masked_hint
 
 
 # ----------------------------------------------------------------------------
@@ -238,7 +261,25 @@ def _run_scenario(
     cfg: Dict[str, Any],
     rank_idx: int, num_ranks: int, group: dist.ProcessGroup,
     diff_tol: float,
+    args: argparse.Namespace,
 ):
+    """Run one SM90 MegaMoE correctness scenario.
+
+    :param name: Scenario name used in logs and deterministic seeding.
+    :type name: str
+    :param cfg: Scenario shape, routing, and activation configuration.
+    :type cfg: Dict[str, Any]
+    :param rank_idx: Current distributed rank.
+    :type rank_idx: int
+    :param num_ranks: Number of distributed ranks.
+    :type num_ranks: int
+    :param group: Distributed process group.
+    :type group: dist.ProcessGroup
+    :param diff_tol: Maximum accepted ``calc_diff`` versus PyTorch reference.
+    :type diff_tol: float
+    :param args: Parsed command-line arguments.
+    :type args: argparse.Namespace
+    """
     num_max = cfg['num_max_tokens_per_rank']
     num_tokens = cfg.get('num_tokens', num_max)
     hidden = cfg['hidden']
@@ -301,7 +342,11 @@ def _run_scenario(
         num_max, num_topk,
         hidden, intermediate_hidden,
     )
-    cum_stats = torch.zeros(num_experts_per_rank, dtype=torch.int, device='cuda')
+    phase_profile_enabled = os.environ.get('DG_SM90_MOE_PHASE_PROFILE', '0') != '0'
+    phase_profile_int_offset = num_experts_per_rank + (num_experts_per_rank % 2)
+    phase_profile_ints = 256 if phase_profile_enabled else 0
+    stats_numel = phase_profile_int_offset + phase_profile_ints if phase_profile_enabled else num_experts_per_rank
+    cum_stats = torch.zeros(stats_numel, dtype=torch.int, device='cuda')
 
     # ---- Run SM90 MegaMoE ----------------------------------------------------
     _trace('copy_inputs')
@@ -309,20 +354,61 @@ def _run_scenario(
     buffer.x_sf[:num_tokens].copy_(x_sf)
     buffer.topk_idx[:num_tokens].copy_(topk_idx)
     buffer.topk_weights[:num_tokens].copy_(topk_w)
+    torch.cuda.synchronize()
+    dist.barrier()
 
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     _trace('launch_sm90 (may JIT-compile, can take minutes)')
-    deep_gemm.fp8_mega_moe(
-        y_fused, transformed_l1, transformed_l2, buffer,
-        cumulative_local_expert_recv_stats=cum_stats,
-        recipe=(128, 128, 128),
-        activation='swiglu',
-        activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
-        fast_math=fast_math,
-    )
+    use_masked_hint = masked_ratio > 0
+    with _masked_hint_scope(use_masked_hint):
+        deep_gemm.fp8_mega_moe(
+            y_fused, transformed_l1, transformed_l2, buffer,
+            cumulative_local_expert_recv_stats=cum_stats,
+            recipe=(128, 128, 128),
+            activation='swiglu',
+            activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
+            fast_math=fast_math,
+        )
     _trace('sync_sm90')
     torch.cuda.synchronize()
     _trace('sm90_done')
+
+    if args.green_context_compare:
+        _trace('green_context_compare')
+        y_green = torch.empty_like(y_fused)
+        buffer.buffer.zero_()
+        cum_stats.zero_()
+        torch.cuda.synchronize()
+        dist.barrier()
+        buffer.x[:num_tokens].copy_(x_fp8)
+        buffer.x_sf[:num_tokens].copy_(x_sf)
+        buffer.topk_idx[:num_tokens].copy_(topk_idx)
+        buffer.topk_weights[:num_tokens].copy_(topk_w)
+        torch.cuda.synchronize()
+        dist.barrier()
+        with _masked_hint_scope(use_masked_hint):
+            green_graph = deep_gemm.SM90FP8MegaMoEGreenCtxGraph(
+                y_green, transformed_l1, transformed_l2, buffer,
+                cumulative_local_expert_recv_stats=cum_stats,
+                recipe=(128, 128, 128),
+                activation='swiglu',
+                activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
+                fast_math=fast_math,
+                kernel1_sms=args.kernel1_sms,
+                kernel2_sms=args.kernel2_sms,
+                reduce_sms=args.reduce_sms,
+            )
+            green_graph.replay()
+        torch.cuda.synchronize()
+        dist.barrier()
+        bitwise = torch.equal(y_green, y_fused)
+        max_abs = (y_green.float() - y_fused.float()).abs().max().item() if y_green.numel() else 0.0
+        dist_print(
+            f'  [{name:<32}] green_ctx bitwise={bitwise} max_abs={max_abs:.6g} '
+            f'K1={green_graph.kernel1_sms} K2={green_graph.kernel2_sms} K3={green_graph.reduce_sms}',
+            once_in_node=True,
+        )
+        assert bitwise, f'{name}: green-context graph differs from SM90 baseline, max_abs={max_abs:.6g}'
 
     # ---- Reference & check ---------------------------------------------------
     # Use the FP8 weights and their block-(128, 128) SF directly — the dequant
@@ -347,7 +433,7 @@ def _run_scenario(
 
     # Verify cum_stats has been incremented (i.e. dispatch ran)
     if num_tokens > 0 and masked_ratio < 1.0:
-        assert cum_stats.sum().item() >= 0  # non-negative; can be 0 if nothing routed here
+        assert cum_stats[:num_experts_per_rank].sum().item() >= 0  # can be 0 if nothing routed here
 
     buffer.destroy()
     dist.barrier()
@@ -488,7 +574,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     failures: List[str] = []
     for name, cfg in layers:
         try:
-            _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol)
+            _run_scenario(name, cfg, rank_idx, num_ranks, group, diff_tol, args)
         except AssertionError as ex:
             dist_print(f'  [{name}] FAIL: {ex}', once_in_node=True)
             failures.append(name)
@@ -523,6 +609,14 @@ if __name__ == '__main__':
                         help='calc_diff tolerance (default: 0.01)')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
+    parser.add_argument('--green-context-compare', action='store_true',
+                        help='Also assert Green Context graph output is bitwise equal to the SM90 baseline')
+    parser.add_argument('--kernel1-sms', type=int, default=None,
+                        help='SMs assigned to dispatch+L1 in Green Context compare mode')
+    parser.add_argument('--kernel2-sms', type=int, default=None,
+                        help='SMs assigned to L2+combine-scatter in Green Context compare mode')
+    parser.add_argument('--reduce-sms', type=int, default=None,
+                        help='SMs assigned to final combine-reduce in Green Context compare mode')
     args = parser.parse_args()
 
     np = args.num_processes

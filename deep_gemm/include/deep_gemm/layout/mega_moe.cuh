@@ -42,6 +42,7 @@ struct Workspace {
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
+    uint32_t num_topk;
     uint32_t num_max_recv_tokens_per_expert;
 
     // Pool capacity: all local experts share a contiguous token pool
@@ -59,7 +60,8 @@ struct Workspace {
               const uint32_t& num_topk):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
-        num_max_tokens_per_rank(num_max_tokens_per_rank) {
+        num_max_tokens_per_rank(num_max_tokens_per_rank),
+        num_topk(num_topk) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
@@ -87,6 +89,11 @@ struct Workspace {
 
         // Dispatch pulling source token-topk
         num_bytes += num_experts_per_rank * num_ranks * num_max_recv_tokens_per_expert * sizeof(int);
+
+        // Dispatch pulling route-count and multi-route entries. Single-rank split K1 uses
+        // these to pull each source token once when several top-k routes stay on the rank.
+        num_bytes += num_ranks * num_max_tokens_per_rank * sizeof(int);
+        num_bytes += num_ranks * num_max_tokens_per_rank * num_topk * sizeof(int);
 
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
@@ -164,10 +171,24 @@ struct Workspace {
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
     }
 
+    CUTLASS_DEVICE
+    uint32_t* get_src_route_count_ptr(
+        const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
+        return get_src_token_topk_idx_ptr(num_experts_per_rank) +
+            rank_idx * num_max_tokens_per_rank + token_idx;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_src_route_entry_ptr(
+        const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0, const uint32_t& topk_idx = 0) const {
+        return get_src_route_count_ptr(num_ranks) +
+            (rank_idx * num_max_tokens_per_rank + token_idx) * num_topk + topk_idx;
+    }
+
     // For combine usages
     CUTLASS_DEVICE
     TokenSrcMetadata* get_token_src_metadata_ptr(const uint32_t& pool_token_idx = 0) const {
-        const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+        const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_route_entry_ptr(num_ranks, 0, 0));
         return base + pool_token_idx;
     }
 };

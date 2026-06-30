@@ -29,7 +29,6 @@ cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declar
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
-
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
 sources = ['csrc/python_api.cpp']
@@ -40,8 +39,24 @@ build_include_dirs = [
     'third-party/cutlass/include',
     'third-party/fmt/include',
 ]
+for _lib_dir in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+    if not _lib_dir:
+        continue
+    _include_dir = Path(_lib_dir).parent / 'include'
+    if _include_dir.is_dir():
+        build_include_dirs.append(str(_include_dir))
+    _cccl_include_dir = _include_dir / 'cccl'
+    if _cccl_include_dir.is_dir():
+        build_include_dirs.append(str(_cccl_include_dir))
+_cuda_home_path = Path(CUDA_HOME)
+_cuda_package_root = _cuda_home_path.parent.parent.parent
+_cccl_home = _cuda_package_root / 'pydeps_cccl' / 'nvidia' / _cuda_home_path.name
+for _include_dir in (_cccl_home / 'include', _cccl_home / 'include' / 'cccl'):
+    if _include_dir.is_dir():
+        build_include_dirs.append(str(_include_dir))
+build_include_dirs = list(dict.fromkeys(build_include_dirs))
 build_libraries = ['cudart', 'nvrtc']
-build_library_dirs = [f'{CUDA_HOME}/lib64']
+build_library_dirs = [f'{CUDA_HOME}/lib64', f'{CUDA_HOME}/lib']
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',

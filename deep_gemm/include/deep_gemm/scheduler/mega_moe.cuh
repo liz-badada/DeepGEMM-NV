@@ -25,6 +25,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kClusterSize = 2,
           bool kL2NMajorSchedule = false,
           bool kL1NMajorSchedule = false,
+          uint32_t kDispatchNumSMs = kNumSMs,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -36,6 +37,7 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(kNumExpertsPerRank % kNumExpertsPerWave == 0, "Invalid wave config");
+    DG_STATIC_ASSERT(kDispatchNumSMs > 0, "Invalid dispatch SM count");
 
     // For 2-CTA clusters, neighbour SMs share the same m_block_idx with adjacent
     // n_block_idx; the asserts below guarantee that pairing is always possible.
@@ -62,7 +64,6 @@ struct MegaMoEScheduler {
     // Pre-cached per-expert token counts (filled during `for_each_block` init)
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
-
     CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
         block_idx = blockIdx.x / kClusterSize;
     }
@@ -215,7 +216,7 @@ struct MegaMoEScheduler {
             if (expert_idx < kNumExpertsPerRank) {
                 do {
                     value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                } while (static_cast<uint32_t>(value >> 32) != kDispatchNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
         }

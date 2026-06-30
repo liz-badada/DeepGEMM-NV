@@ -1,3 +1,4 @@
+import datetime
 import inspect
 import os
 import torch
@@ -8,15 +9,26 @@ _local_rank = None
 
 
 def init_dist(local_rank: int, num_local_ranks: int) -> Tuple[int, int, dist.ProcessGroup]:
+    """Initialize the local NCCL process group.
+
+    :param local_rank: CUDA device index for the local process.
+    :type local_rank: int
+    :param num_local_ranks: Number of local CUDA ranks launched per node.
+    :type num_local_ranks: int
+    :return: Global rank, global world size, and the full process group.
+    :rtype: Tuple[int, int, dist.ProcessGroup]
+    """
     # NOTES: you may rewrite this function with your own cluster settings
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
+    timeout_sec = int(os.getenv('DG_DIST_TIMEOUT_SEC', '0'))
 
     # Set local rank
     global _local_rank
     _local_rank = local_rank
+    torch.cuda.set_device(local_rank)
 
     sig = inspect.signature(dist.init_process_group)
     params = {
@@ -25,14 +37,15 @@ def init_dist(local_rank: int, num_local_ranks: int) -> Tuple[int, int, dist.Pro
         'world_size': num_nodes * num_local_ranks,
         'rank': node_rank * num_local_ranks + local_rank,
     }
+    if timeout_sec > 0:
+        params['timeout'] = datetime.timedelta(seconds=timeout_sec)
     if 'device_id' in sig.parameters:
         # noinspection PyTypeChecker
         params['device_id'] = torch.device(f'cuda:{local_rank}')
     dist.init_process_group(**params)
     torch.set_default_device('cuda')
-    torch.cuda.set_device(local_rank)
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
+    return dist.get_rank(), dist.get_world_size(), dist.group.WORLD
 
 
 def uneven_all_gather(tensor: torch.Tensor, dim: int = 0, group: dist.ProcessGroup = None) -> torch.Tensor:
