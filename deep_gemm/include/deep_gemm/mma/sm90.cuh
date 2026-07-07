@@ -74,6 +74,24 @@ struct FP8MMASelector {
     using type = decltype(select_type());
 };
 
+// Hopper supports mixed FP8 inputs natively. Keep this selector deliberately
+// narrow until another measured shape needs it: the Green Context scale-free
+// L1-to-K2 path uses exactly M64N128K32 with E5M2 A and E4M3 weights.
+template <int N>
+struct FP8E5M2E4M3MMASelector {
+    static constexpr auto select_mma() {
+        using namespace cute::SM90::GMMA;
+        static_assert(N == 128, "Scale-free L1-to-K2 currently requires N128 WGMMA");
+        return MMA_64x128x32_F32E5M2E4M3_SS_TN();
+    }
+
+    static constexpr auto select_type() {
+        return FP8MMA<N, decltype(select_mma())>();
+    }
+
+    using type = decltype(select_type());
+};
+
 template <int N_, typename MMA>
 struct BF16MMA {
     template <size_t ...Idx>

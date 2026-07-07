@@ -262,9 +262,9 @@ struct MegaMoESM90Config {
     // Cluster size for TMA multicast (1 or 2). Multicast is on A.
     int cluster_size;
 
-    // Pool capacity and SF-padded token count (SF is per-128 float on SM90)
+    // Pool capacity, allocated SF capacity, and per-config logical SF stride.
     int num_max_pool_tokens;
-    int num_padded_sf_pool_tokens;
+    int num_padded_sf_pool_tokens, sf_pool_stride_tokens;
 
     // Swizzle modes for TMA descriptors (acts/weights). Both are 128B on FP8 K-major.
     int swizzle_acts_mode, swizzle_weights_mode;
@@ -294,6 +294,7 @@ struct MegaMoESM90Config {
            << ", cluster_size=" << config.cluster_size
            << ", num_max_pool_tokens=" << config.num_max_pool_tokens
            << ", num_padded_sf_pool_tokens=" << config.num_padded_sf_pool_tokens
+           << ", sf_pool_stride_tokens=" << config.sf_pool_stride_tokens
            << ", swizzle_acts_mode=" << config.swizzle_acts_mode << ", swizzle_weights_mode=" << config.swizzle_weights_mode
            << ", num_experts_per_wave=" << config.num_experts_per_wave
            << ", num_stages=" << config.num_stages << ", smem_size=" << config.smem_size
@@ -777,10 +778,12 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
     const int& num_padded_sf_pool_tokens) {
     const int forced_block_m = get_env<int>("DG_SM90_MOE_FORCE_BLOCK_M");
     const int forced_epilogue_warpgroups = get_env<int>("DG_SM90_MOE_FORCE_EPILOGUE_WG");
-    DG_HOST_ASSERT(forced_block_m == 0 or forced_block_m == 64 or forced_block_m == 128);
+    DG_HOST_ASSERT(forced_block_m == 0 or forced_block_m == 64 or
+                   forced_block_m == 128 or forced_block_m == 192);
     DG_HOST_ASSERT(forced_epilogue_warpgroups == 0 or
                    forced_epilogue_warpgroups == 1 or
-                   forced_epilogue_warpgroups == 2);
+                   forced_epilogue_warpgroups == 2 or
+                   forced_epilogue_warpgroups == 3);
 
     const bool use_bn256_split_n_env =
         get_env<int>("DG_SM90_MOE_BN256_2WG", 1) != 0 and
@@ -821,15 +824,20 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                     continue;
                 if (block_m == 128 and num_epilogue_warpgroups != 2)
                     continue;
+                if (block_m == 192 and
+                    not (block_n == 128 and num_epilogue_warpgroups == 3))
+                    continue;
                 if (block_m == 64 and block_n == 256 and num_epilogue_warpgroups != 2)
                     continue;
                 const int num_epilogue_threads = num_epilogue_warpgroups * 128;
 
-                const int cluster_size = 1;
+                const int cluster_size =
+                    get_env<int>("DG_SM90_MOE_FORCE_CLUSTER_SIZE", 1);
+                DG_HOST_ASSERT(cluster_size == 1 or cluster_size == 2);
                 const int swizzle_acts_mode = 128;
                 const int swizzle_weights_mode = 128;
 
-                const bool compact_frontend = block_n == 256;
+                const bool compact_frontend = block_n == 256 or block_m == 192;
                 const int forced_dispatch_warps = get_env<int>("DG_SM90_MOE_DISPATCH_WARPS", -1);
                 DG_HOST_ASSERT(forced_dispatch_warps == -1 or forced_dispatch_warps == 0 or
                                forced_dispatch_warps == 2 or forced_dispatch_warps == 4 or
@@ -908,10 +916,12 @@ static std::vector<MegaMoESM90Config> get_mega_moe_config_candidates_sm90(
                                             num_experts_per_wave > num_experts_per_rank or
                                             num_experts_per_rank % num_experts_per_wave != 0)
                                             continue;
+                                        const int sf_pool_stride_tokens =
+                                            layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m);
                                         candidates.emplace_back(MegaMoESM90Config {
                                             block_m, block_n, block_k,
                                             cluster_size,
-                                            num_max_pool_tokens, num_padded_sf_pool_tokens,
+                                            num_max_pool_tokens, num_padded_sf_pool_tokens, sf_pool_stride_tokens,
                                             swizzle_acts_mode, swizzle_weights_mode,
                                             num_experts_per_wave,
                                             num_stages, smem_size,

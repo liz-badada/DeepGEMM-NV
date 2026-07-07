@@ -30,12 +30,49 @@ CUTLASS_HOST_DEVICE constexpr T get_num_padded_sf_pool_tokens(T num_max_pool_tok
     return (num_max_pool_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
 }
 
-// Per-token source metadata for combine write-back
+// Per-token source metadata for combine write-back. Keep this record compact:
+// K2 reads it for every output row, while all supported bounds fit in 29 bits.
 struct TokenSrcMetadata {
-    uint32_t rank_idx;
-    uint32_t token_idx;
-    uint32_t topk_idx;
+    static constexpr uint32_t kRankBits = 7;
+    static constexpr uint32_t kTokenBits = 16;
+    static constexpr uint32_t kTopkBits = 6;
+    static constexpr uint32_t kRankShift = 0;
+    static constexpr uint32_t kTokenShift = kRankShift + kRankBits;
+    static constexpr uint32_t kTopkShift = kTokenShift + kTokenBits;
+    static constexpr uint32_t kRankMask = (1u << kRankBits) - 1u;
+    static constexpr uint32_t kTokenMask = (1u << kTokenBits) - 1u;
+    static constexpr uint32_t kTopkMask = (1u << kTopkBits) - 1u;
+
+    uint32_t packed;
+
+    CUTLASS_HOST_DEVICE
+    constexpr TokenSrcMetadata(): packed(0) {}
+
+    CUTLASS_HOST_DEVICE
+    constexpr TokenSrcMetadata(
+        const uint32_t& rank_idx, const uint32_t& token_idx, const uint32_t& topk_idx):
+        packed(((rank_idx & kRankMask) << kRankShift) |
+               ((token_idx & kTokenMask) << kTokenShift) |
+               ((topk_idx & kTopkMask) << kTopkShift)) {}
+
+    CUTLASS_HOST_DEVICE
+    constexpr uint32_t rank_idx() const {
+        return (packed >> kRankShift) & kRankMask;
+    }
+
+    CUTLASS_HOST_DEVICE
+    constexpr uint32_t token_idx() const {
+        return (packed >> kTokenShift) & kTokenMask;
+    }
+
+    CUTLASS_HOST_DEVICE
+    constexpr uint32_t topk_idx() const {
+        return (packed >> kTopkShift) & kTopkMask;
+    }
 };
+
+static_assert(TokenSrcMetadata::kTopkShift + TokenSrcMetadata::kTopkBits <= 32);
+static_assert(sizeof(TokenSrcMetadata) == sizeof(uint32_t));
 
 struct Workspace {
     void* base;

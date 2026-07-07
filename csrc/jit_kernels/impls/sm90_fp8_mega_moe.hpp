@@ -62,6 +62,9 @@ public:
         bool one_warp_cleanup;
         int dispatch_num_sms;
         KernelPhase kernel_phase;
+        bool scale_free_l1_k2;
+        bool drop_scale_free_sfa;
+        bool fp8_compressed_combine;
         MegaMoESM90Config config;
 
         // Runtime arguments
@@ -91,11 +94,30 @@ public:
         const char* kernel_symbol = args.kernel_phase == KernelPhase::Linear1 ? "sm90_fp8_mega_moe_l1_impl" :
             (args.kernel_phase == KernelPhase::Linear2 ? "sm90_fp8_mega_moe_l2_impl" :
              "sm90_fp8_mega_moe_l2_no_reduce_impl");
+        const bool scale_free_l1_k2 =
+            args.scale_free_l1_k2 &&
+            (args.kernel_phase == KernelPhase::Linear1 ||
+             args.kernel_phase == KernelPhase::Linear2NoReduce) &&
+            args.num_ranks == 8 && args.num_max_tokens_per_rank >= 7000 &&
+            args.num_tokens == 7000 && args.hidden == 3072 &&
+            args.intermediate_hidden == 1536 && args.num_experts == 128 &&
+            args.num_topk == 16 && args.config.block_m == 192 &&
+            args.config.block_n == 128 && args.config.block_k == 128;
+        const bool drop_scale_free_sfa = scale_free_l1_k2 &&
+            args.drop_scale_free_sfa;
+        std::string feature_defines;
+        if (scale_free_l1_k2)
+            feature_defines += "#define DG_SM90_MOE_SCALE_FREE_L1_K2 1\n";
+        if (drop_scale_free_sfa)
+            feature_defines += "#define DG_SM90_MOE_SCALE_FREE_DROP_SFA 1\n";
+        if (args.fp8_compressed_combine)
+            feature_defines += "#define DG_SM90_MOE_FP8_COMPRESSED_COMBINE 1\n";
         return fmt::format(R"(
+{}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 // JIT cache salt: current SM90 MegaMoE three-stage green-context core.
-static constexpr int kSm90MegaMoECoreJitVersion = 44;
+static constexpr int kSm90MegaMoECoreJitVersion = 51;
 
 using namespace deep_gemm;
 
@@ -106,6 +128,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {}, {},
+        {},
         {},
         {},
         {},
@@ -138,6 +161,7 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    feature_defines,
     kernel_symbol,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
@@ -146,6 +170,7 @@ static void __instantiate_kernel() {{
     args.config.block_m, args.config.block_n, args.config.block_k,
     args.config.num_max_pool_tokens,
     args.config.num_padded_sf_pool_tokens,
+    args.config.sf_pool_stride_tokens,
     args.config.num_stages,
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.config.cluster_size,
@@ -206,6 +231,7 @@ public:
         int num_padded_sf_pool_tokens;
         bool phase_profile;
         bool direct_global_reduce;
+        bool fp8_compressed_combine;
 
         void* y;
         int* cumulative_local_expert_recv_stats;
@@ -216,12 +242,15 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const char* feature_define = args.fp8_compressed_combine ?
+            "#define DG_SM90_MOE_FP8_COMPRESSED_COMBINE 1" : "";
         return fmt::format(R"(
+{}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 // JIT cache salt: single-rank and opt-in multi-rank K3 can use token/vector global reduce.
 // Keep this in the generated code so header-only K3 changes invalidate the cache.
-static constexpr int kSm90MegaMoECombineReduceJitVersion = 7;
+static constexpr int kSm90MegaMoECombineReduceJitVersion = 8;
 
 using namespace deep_gemm;
 
@@ -239,6 +268,7 @@ static void __instantiate_kernel() {{
         >);
 }};
 )",
+    feature_define,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
@@ -310,6 +340,7 @@ private:
     uint32_t reduce_sms_ = 0;
     float activation_clamp_ = 0.0f;
     bool fast_math_ = true;
+    bool fp8_compressed_combine_requested_ = false;
     MegaMoESM90Config config_;
 
     int device_idx_ = 0;
@@ -405,8 +436,8 @@ private:
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_sf_buffer.base)),
-            {static_cast<int64_t>(num_padded_sf_pool_tokens_), static_cast<int64_t>(hidden_ / kGranK)},
-            {1, static_cast<int64_t>(num_padded_sf_pool_tokens_)},
+            {static_cast<int64_t>(config_.sf_pool_stride_tokens), static_cast<int64_t>(hidden_ / kGranK)},
+            {1, static_cast<int64_t>(config_.sf_pool_stride_tokens)},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_token_buffer.base)),
@@ -414,8 +445,8 @@ private:
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l2_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l2_sf_buffer.base)),
-            {static_cast<int64_t>(num_padded_sf_pool_tokens_), static_cast<int64_t>(intermediate_hidden_ / 64)},
-            {1, static_cast<int64_t>(num_padded_sf_pool_tokens_)},
+            {static_cast<int64_t>(config_.sf_pool_stride_tokens), static_cast<int64_t>(intermediate_hidden_ / 64)},
+            {1, static_cast<int64_t>(config_.sf_pool_stride_tokens)},
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return {l1_acts, l1_acts_sf, l2_acts, l2_acts_sf};
     }
@@ -474,8 +505,105 @@ private:
     MegaMoESM90Config make_phase_config(
         const SM90FP8MegaMoERuntime::KernelPhase& phase) const {
         auto phase_config = config_;
+
+        // Exact-shape experiment: allow the two Green Context phases to use
+        // different row tilings.  The graph already builds separate kernels
+        // and TMA descriptors for L1 and L2, so keeping this override here
+        // isolates phase-local tiling without perturbing the regular selector.
+        const bool exact_h200_target =
+            num_ranks() == 8 and num_experts_ == 128 and num_experts_per_rank_ == 16 and
+            num_max_tokens_per_rank_ >= 7000 and num_tokens_ == 7000 and num_topk_ == 16 and
+            hidden_ == 3072 and intermediate_hidden_ == 1536;
+        const char* phase_block_m_env =
+            phase == SM90FP8MegaMoERuntime::KernelPhase::Linear1 ?
+            "DG_SM90_MOE_GREEN_L1_BLOCK_M" : "DG_SM90_MOE_GREEN_L2_BLOCK_M";
+        const int phase_block_m = get_env<int>(phase_block_m_env, 0);
+        DG_HOST_ASSERT(phase_block_m == 0 or phase_block_m == 64 or phase_block_m == 128);
+        if (exact_h200_target) {
+            // Keep experimental switches scoped to the requested H200 shape.
+            // Each switch is independently JIT-specialized through the config.
+            phase_config.l2_dual_accum = get_env<int>("DG_SM90_MOE_L2_DUAL_ACCUM", 0) != 0;
+            phase_config.l1_dual_k_accum = get_env<int>("DG_SM90_MOE_L1_DUAL_K", 0) != 0;
+            phase_config.l2_sfa_2row_tma = get_env<int>("DG_SM90_MOE_L2_SFA_2ROW_TMA", 0) != 0;
+            phase_config.l2_precompute_scale = get_env<int>("DG_SM90_MOE_L2_PRECOMPUTE_SCALE", 0) != 0;
+            phase_config.l2_ratio_accum = get_env<int>("DG_SM90_MOE_L2_RATIO_ACCUM", 0) != 0;
+            phase_config.l2_weight_sf_ldu = get_env<int>("DG_SM90_MOE_L2_WEIGHT_SF_LDU", 0) != 0;
+            phase_config.l2_prefetch_weight_sf = get_env<int>("DG_SM90_MOE_L2_PREFETCH_WEIGHT_SF", 0) != 0;
+            phase_config.l2_fast_weight_sf_n = get_env<int>("DG_SM90_MOE_L2_FAST_WEIGHT_SF_N", 0) != 0;
+            phase_config.l2_hoist_weight_sf_base = get_env<int>("DG_SM90_MOE_L2_HOIST_WEIGHT_SF_BASE", 0) != 0;
+            phase_config.l2_delay_sfa_load = get_env<int>("DG_SM90_MOE_L2_DELAY_SFA_LOAD", 0) != 0;
+            phase_config.l2_split_sfa_load = get_env<int>("DG_SM90_MOE_L2_SPLIT_SFA_LOAD", 0) != 0;
+            phase_config.l2_skip_post_wgmma_fence = get_env<int>("DG_SM90_MOE_L2_SKIP_POST_WGMMA_FENCE", 0) != 0;
+            phase_config.l2_first_accum_assign = get_env<int>("DG_SM90_MOE_L2_FIRST_ACCUM_ASSIGN", 0) != 0;
+            phase_config.l2_n64_interleave = get_env<int>("DG_SM90_MOE_L2_N64_INTERLEAVE", 0) != 0;
+            phase_config.l2_half_k_pipeline = get_env<int>("DG_SM90_MOE_L2_HALF_K_PIPELINE", 0) != 0;
+            phase_config.async_l1_tma_store = get_env<int>("DG_SM90_MOE_ASYNC_L1_STORE", 0) != 0;
+            if (phase == SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce and
+                get_env<int>("DG_SM90_MOE_L2_SPLIT_SFA_TMA", 0) != 0) {
+                // K2NoReduce does not need dispatch/cleanup workers.  Reuse the
+                // same four-warp frontend as three independent TMA producers
+                // plus one idle warp, keeping the math warpgroups aligned.
+                phase_config.num_dispatch_threads = 0;
+                phase_config.num_non_epilogue_threads = 128;
+                phase_config.split_sfa_tma = true;
+            }
+            if (phase == SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce) {
+                const int forced_l2_stages =
+                    get_env<int>("DG_SM90_MOE_GREEN_L2_NUM_STAGES", 0);
+                DG_HOST_ASSERT(forced_l2_stages == 0 or
+                               (forced_l2_stages >= 2 and forced_l2_stages <= 5));
+                if (forced_l2_stages > 0)
+                    phase_config.num_stages = forced_l2_stages;
+            }
+        }
+        if (exact_h200_target and phase_block_m != 0) {
+            phase_config.block_m = phase_block_m;
+            phase_config.block_n = phase_block_m == 64 ? 256 : 128;
+            phase_config.block_k = 128;
+            phase_config.cluster_size = 1;
+            phase_config.num_dispatch_threads = phase_block_m == 64 ? 64 : 128;
+            phase_config.num_non_epilogue_threads = phase_block_m == 64 ? 64 : 128;
+            phase_config.num_epilogue_threads = 256;
+            phase_config.num_experts_per_wave = get_num_experts_per_wave_for_mega_moe_sm90(
+                static_cast<int>(num_experts_per_rank_), static_cast<int>(num_tokens_),
+                static_cast<int>(num_topk_), static_cast<int>(intermediate_hidden_),
+                phase_config.block_m, phase_config.block_n, device_runtime->get_num_sms());
+            phase_config.direct_l2_scatter = false;
+            phase_config.l2_nmajor_schedule = false;
+            phase_config.one_warp_cleanup = false;
+            const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
+                SM90ArchSpec::smem_capacity,
+                static_cast<int>(num_experts_), static_cast<int>(hidden_),
+                phase_config.block_m, phase_config.block_n, phase_config.block_k,
+                phase_config.num_dispatch_threads / 32,
+                phase_config.num_epilogue_threads / 32,
+                false, false, 4);
+            phase_config.num_stages = num_stages;
+            phase_config.smem_size = smem_size;
+        }
+        // Use the tuned EPW only for the fully compressed target configuration.
+        // Preserve the global EPW environment variable as a debugging override.
+        if (exact_h200_target and
+            kernel1_sms_ == 78 and kernel2_sms_ == 54 and reduce_sms_ == 124 and
+            fp8_compressed_combine_requested_ and
+            get_env<int>("DG_SM90_MOE_SCALE_FREE_L1_K2", 0) != 0 and
+            get_env<int>("DG_SM90_MOE_EXPERTS_PER_WAVE", 0) == 0) {
+            phase_config.num_experts_per_wave = 4;
+        }
         if (phase == SM90FP8MegaMoERuntime::KernelPhase::Linear1)
             phase_config.direct_l2_scatter = false;
+        if (phase == SM90FP8MegaMoERuntime::KernelPhase::Linear1 and
+            phase_config.async_l1_tma_store) {
+            const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
+                SM90ArchSpec::smem_capacity,
+                static_cast<int>(num_experts_), static_cast<int>(hidden_),
+                phase_config.block_m, phase_config.block_n, phase_config.block_k,
+                phase_config.num_dispatch_threads / 32,
+                phase_config.num_epilogue_threads / 32,
+                false, true, phase_config.num_stages);
+            phase_config.num_stages = num_stages;
+            phase_config.smem_size = smem_size;
+        }
         if (phase == SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce) {
             const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
                 SM90ArchSpec::smem_capacity,
@@ -547,6 +675,9 @@ private:
             .one_warp_cleanup = phase_config.one_warp_cleanup,
             .dispatch_num_sms = static_cast<int>(dispatch_num_sms),
             .kernel_phase = phase,
+            .scale_free_l1_k2 = get_env<int>("DG_SM90_MOE_SCALE_FREE_L1_K2", 0) != 0,
+            .drop_scale_free_sfa = get_env<int>("DG_SM90_MOE_SCALE_FREE_DROP_SFA", 1) != 0,
+            .fp8_compressed_combine = false,
             .config = phase_config,
             .y = nullptr,
             .cumulative_local_expert_recv_stats = nullptr,
@@ -576,14 +707,41 @@ private:
         return reduce_grid;
     }
 
+    int get_reduce_threads() const {
+        const int threads = get_env<int>("DG_SM90_MOE_K3_THREADS", 256);
+        DG_HOST_ASSERT(threads == 128 or threads == 256 or threads == 384 or threads == 512);
+        return threads;
+    }
+
+    bool use_fused_reduce() const {
+        return get_env<int>("DG_SM90_MOE_GREEN_FUSED_REDUCE", 0) != 0;
+    }
+
     void build_kernel_runtimes() {
+        const auto kernel2_phase = use_fused_reduce() ?
+            SM90FP8MegaMoERuntime::KernelPhase::Linear2 :
+            SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce;
         const auto kernel1_static_args = make_phase_args(
             SM90FP8MegaMoERuntime::KernelPhase::Linear1, kernel1_sms_, kernel1_sms_);
-        const auto kernel2_static_args = make_phase_args(
-            SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce, kernel2_sms_, kernel1_sms_);
-        const int reduce_threads = 256;
+        auto kernel2_static_args = make_phase_args(
+            kernel2_phase, kernel2_sms_, kernel1_sms_);
+        const int reduce_threads = get_reduce_threads();
         const uint32_t reduce_grid = get_reduce_grid();
-        constexpr bool direct_global_reduce = false;
+        const bool direct_global_reduce =
+            num_ranks() > 1 and
+            get_env<int>("DG_SM90_MOE_K3_DIRECT_GLOBAL_REDUCE", 0) != 0;
+        const bool fp8_compressed_combine =
+            fp8_compressed_combine_requested_ &&
+            kernel2_phase == SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce &&
+            not direct_global_reduce && (reduce_threads == 256 || reduce_threads == 384) &&
+            num_ranks() == 8 && num_max_tokens_per_rank_ >= 7000 &&
+            hidden_ == 3072 && intermediate_hidden_ == 1536 &&
+            num_experts_ == 128 && num_topk_ == 16 &&
+            kernel2_static_args.config.block_m == 192 &&
+            kernel2_static_args.config.block_n == 128 &&
+            kernel2_static_args.config.block_k == 128 &&
+            kernel2_static_args.config.num_epilogue_threads == 384;
+        kernel2_static_args.fp8_compressed_combine = fp8_compressed_combine;
         const int reduce_smem_size = (num_ranks() == 1 or direct_global_reduce) ? 0 :
             get_sm90_moe_combine_reduce_smem_size(static_cast<int>(hidden_), reduce_threads);
         const SM90FP8MegaMoECombineReduceRuntime::Args reduce_static_args = {
@@ -596,6 +754,7 @@ private:
             .num_padded_sf_pool_tokens = static_cast<int>(num_padded_sf_pool_tokens_),
             .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
             .direct_global_reduce = direct_global_reduce,
+            .fp8_compressed_combine = fp8_compressed_combine,
             .y = nullptr,
             .cumulative_local_expert_recv_stats = nullptr,
             .num_tokens = num_tokens_,
@@ -620,10 +779,13 @@ private:
         constexpr int kGranK = 128;
         constexpr int kL2ActsSFGranK = 64;
 
+        const auto kernel2_phase = use_fused_reduce() ?
+            SM90FP8MegaMoERuntime::KernelPhase::Linear2 :
+            SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce;
         kernel1_args_ = make_phase_args(
             SM90FP8MegaMoERuntime::KernelPhase::Linear1, kernel1_sms_, kernel1_sms_);
         kernel2_args_ = make_phase_args(
-            SM90FP8MegaMoERuntime::KernelPhase::Linear2NoReduce, kernel2_sms_, kernel1_sms_);
+            kernel2_phase, kernel2_sms_, kernel1_sms_);
         const auto& l1_config = kernel1_args_.config;
         const auto& l2_config = kernel2_args_.config;
 
@@ -634,7 +796,7 @@ private:
             l1_config.swizzle_acts_mode);
         const auto tensor_map_l1_acts_sf = make_tma_sf_desc(
             cute::UMMA::Major::MN, views.l1_acts_sf,
-            l1_config.num_padded_sf_pool_tokens, hidden_,
+            l1_config.sf_pool_stride_tokens, hidden_,
             l1_config.block_m, kGranK,
             1, 0);
         const auto tensor_map_l1_weights = make_tma_2d_desc(
@@ -658,7 +820,7 @@ private:
             l2_config.swizzle_acts_mode);
         const auto tensor_map_l2_acts_sf = make_tma_sf_desc(
             cute::UMMA::Major::MN, views.l2_acts_sf,
-            l2_config.num_padded_sf_pool_tokens, intermediate_hidden_,
+            l2_config.sf_pool_stride_tokens, intermediate_hidden_,
             l2_config.block_m, kL2ActsSFGranK,
             1, 0, 0, l2_config.l2_sfa_2row_tma ? 2 : 1);
         const auto tensor_map_l2_weights = make_tma_2d_desc(
@@ -683,8 +845,12 @@ private:
             args->l2_weights_sf = l2_weights_sf_.data_ptr<float>();
         }
         const uint32_t reduce_grid = get_reduce_grid();
-        const int reduce_smem_size = num_ranks() == 1 ? 0 :
-            get_sm90_moe_combine_reduce_smem_size(static_cast<int>(hidden_), 256);
+        const bool direct_global_reduce =
+            num_ranks() > 1 and
+            get_env<int>("DG_SM90_MOE_K3_DIRECT_GLOBAL_REDUCE", 0) != 0;
+        const int reduce_threads = get_reduce_threads();
+        const int reduce_smem_size = (num_ranks() == 1 or direct_global_reduce) ? 0 :
+            get_sm90_moe_combine_reduce_smem_size(static_cast<int>(hidden_), reduce_threads);
         reduce_args_ = {
             .num_max_tokens_per_rank = static_cast<int>(num_max_tokens_per_rank_),
             .hidden = static_cast<int>(hidden_),
@@ -694,11 +860,12 @@ private:
             .num_ranks = static_cast<int>(num_ranks()),
             .num_padded_sf_pool_tokens = static_cast<int>(num_padded_sf_pool_tokens_),
             .phase_profile = get_env<int>("DG_SM90_MOE_PHASE_PROFILE", 0) != 0,
+            .direct_global_reduce = direct_global_reduce,
             .y = y_.data_ptr(),
             .cumulative_local_expert_recv_stats = stats_.data_ptr<int>(),
             .num_tokens = num_tokens_,
             .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs_, rank_idx_),
-            .launch_args = LaunchArgs(static_cast<int>(reduce_grid), 256,
+            .launch_args = LaunchArgs(static_cast<int>(reduce_grid), reduce_threads,
                                       reduce_smem_size, 1, false)
         };
 
@@ -854,12 +1021,14 @@ private:
         kernel2_node_ = add_kernel_node(
             green_contexts_[1], kernel2_graph_kernel_, kernel2_args_.launch_args,
             kernel2_params_.data(), {});
-        const std::vector<cudaGraphNode_t> reduce_dependencies = {
-            kernel1_node_, kernel2_node_
-        };
-        reduce_node_ = add_kernel_node(
-            primary_context_, reduce_graph_kernel_, reduce_args_.launch_args,
-            reduce_params_.data(), reduce_dependencies);
+        if (!use_fused_reduce()) {
+            const std::vector<cudaGraphNode_t> reduce_dependencies = {
+                kernel1_node_, kernel2_node_
+            };
+            reduce_node_ = add_kernel_node(
+                primary_context_, reduce_graph_kernel_, reduce_args_.launch_args,
+                reduce_params_.data(), reduce_dependencies);
+        }
 
         DG_CUDA_RUNTIME_CHECK(lazy_cudaGraphInstantiate(&graph_exec_, graph_, 0));
     }
@@ -928,7 +1097,9 @@ public:
         kernel2_sms_(checked_positive_u32(kernel2_sms)),
         reduce_sms_(checked_positive_u32(reduce_sms)),
         activation_clamp_(activation_clamp_opt.value_or(std::numeric_limits<float>::infinity())),
-        fast_math_(fast_math) {
+        fast_math_(fast_math),
+        fp8_compressed_combine_requested_(
+            get_env<int>("DG_SM90_MOE_FP8_COMPRESSED_COMBINE", 0) != 0) {
         DG_HOST_ASSERT(not sym_buffer_ptrs_.empty());
         DG_HOST_ASSERT(num_experts_ % num_ranks() == 0);
         num_experts_per_rank_ = num_experts_ / num_ranks();
@@ -1054,7 +1225,7 @@ static void sm90_fp8_mega_moe(
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
-                                                        config.num_padded_sf_pool_tokens, hidden,
+                                                        config.sf_pool_stride_tokens, hidden,
                                                         config.block_m, kGranK,
                                                         1, 0);
     const auto tensor_map_l1_weights = make_tma_2d_desc(l1_weights,
@@ -1084,7 +1255,7 @@ static void sm90_fp8_mega_moe(
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                                                        config.num_padded_sf_pool_tokens, intermediate_hidden,
+                                                        config.sf_pool_stride_tokens, intermediate_hidden,
                                                         config.block_m, kL2ActsSFGranK,
                                                         1, 0, 0, config.l2_sfa_2row_tma ? 2 : 1);
     const auto tensor_map_l2_weights = make_tma_2d_desc(l2_weights,
@@ -1113,6 +1284,9 @@ static void sm90_fp8_mega_moe(
         .one_warp_cleanup = config.one_warp_cleanup,
         .dispatch_num_sms = num_sms,
         .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Linear1,
+        .scale_free_l1_k2 = false,
+        .drop_scale_free_sfa = false,
+        .fp8_compressed_combine = false,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

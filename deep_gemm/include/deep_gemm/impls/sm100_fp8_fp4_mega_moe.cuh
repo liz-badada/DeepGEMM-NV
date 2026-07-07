@@ -1197,9 +1197,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             break;
 
                         const auto src_metadata = *workspace.get_token_src_metadata_ptr(m_idx + m_idx_in_block);
-                        const uint32_t dst_rank_idx = src_metadata.rank_idx;
-                        const uint32_t dst_token_idx = src_metadata.token_idx;
-                        const uint32_t dst_topk_idx = src_metadata.topk_idx;
+                        const uint32_t dst_rank_idx = src_metadata.rank_idx();
+                        const uint32_t dst_token_idx = src_metadata.token_idx();
+                        const uint32_t dst_topk_idx = src_metadata.topk_idx();
 
                         // Read from shared memory
                         const auto smem_ptr = smem_cd_l2 +
